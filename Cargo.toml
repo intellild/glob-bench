@@ -1,0 +1,17 @@
+[package]
+name = "glob_benchs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[dev-dependencies]
+criterion = { version = "0.6", features = ["html_reports"] }
+fast-glob = "1.0.1"
+glob = "0.3.3"
+globset = "0.4.16"
+wax = { version = "0.7.0", default-features = false }
+
+[[bench]]
+name = "multi_pattern"
+harness = false
