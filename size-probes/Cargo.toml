@@ -1,0 +1,46 @@
+[package]
+name = "glob_size_probes"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+fast-glob = { version = "1.0.1", optional = true }
+glob = { version = "0.3.3", optional = true }
+globset = { version = "0.4.16", optional = true }
+pcre2 = { version = "0.2.11", optional = true }
+regex = { version = "1.12.2", optional = true }
+wax = { version = "0.7.0", default-features = false, optional = true }
+
+[profile.release]
+strip = "symbols"
+
+[[bin]]
+name = "fast_glob"
+path = "src/bin/fast_glob.rs"
+required-features = ["fast-glob"]
+
+[[bin]]
+name = "glob_scan"
+path = "src/bin/glob_scan.rs"
+required-features = ["glob"]
+
+[[bin]]
+name = "globset_set"
+path = "src/bin/globset_set.rs"
+required-features = ["globset"]
+
+[[bin]]
+name = "regex_set"
+path = "src/bin/regex_set.rs"
+required-features = ["globset", "regex"]
+
+[[bin]]
+name = "pcre2_jit_scan"
+path = "src/bin/pcre2_jit_scan.rs"
+required-features = ["globset", "pcre2"]
+
+[[bin]]
+name = "wax_any"
+path = "src/bin/wax_any.rs"
+required-features = ["wax"]

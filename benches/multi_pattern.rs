@@ -4,6 +4,8 @@ use std::path::Path;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use glob::Pattern;
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use pcre2::bytes::{Regex as Pcre2Regex, RegexBuilder as Pcre2RegexBuilder};
+use regex::bytes::RegexSet;
 use wax::Program;
 
 const INCLUDE_PATTERNS: &[&str] = &[
@@ -37,6 +39,9 @@ const EXCLUDE_PATTERNS: &[&str] = &[
     "docs/**/drafts/**",
     "tmp/**",
 ];
+
+const TYPESCRIPT_INCLUDE_PATTERNS: &[&str] = &["**/**.ts"];
+const TYPESCRIPT_EXCLUDE_PATTERNS: &[&str] = &["foo/*.ts"];
 
 fn corpus(size: usize) -> Vec<String> {
     let roots = [
@@ -97,6 +102,44 @@ fn corpus(size: usize) -> Vec<String> {
         .collect()
 }
 
+fn typescript_corpus(size: usize) -> Vec<String> {
+    let roots = [
+        "foo",
+        "foo/bar",
+        "src",
+        "src/features",
+        "packages/web/src",
+        "packages/api/src",
+        "packages/web/node_modules/react",
+        "packages/web/dist",
+        "tests",
+        "tmp",
+    ];
+    let stems = [
+        "index",
+        "app",
+        "route",
+        "model",
+        "service",
+        "component",
+        "generated",
+        "spec",
+    ];
+    let exts = ["ts", "tsx", "js", "d.ts", "map"];
+
+    (0..size)
+        .map(|i| {
+            if i % 37 == 0 {
+                return format!("foo/{}.ts", stems[i % stems.len()]);
+            }
+            let root = roots[i % roots.len()];
+            let stem = stems[(i / roots.len()) % stems.len()];
+            let ext = exts[(i / (roots.len() * stems.len())) % exts.len()];
+            format!("{root}/level-{}/branch-{}/{stem}.{ext}", i % 13, i % 19)
+        })
+        .collect()
+}
+
 fn compile_glob_patterns() -> Vec<Pattern> {
     INCLUDE_PATTERNS
         .iter()
@@ -127,14 +170,54 @@ fn compile_globsets() -> (GlobSet, GlobSet) {
     )
 }
 
-fn count_fast_glob(paths: &[String]) -> usize {
+fn glob_regex(pattern: &str) -> String {
+    Glob::new(pattern).unwrap().regex().to_owned()
+}
+
+fn pcre2_glob_regex(pattern: &str) -> String {
+    glob_regex(pattern).replace("(?-u)", "")
+}
+
+fn compile_regex_set(patterns: &[&str]) -> RegexSet {
+    let regexes = patterns
+        .iter()
+        .map(|pattern| glob_regex(pattern))
+        .collect::<Vec<_>>();
+    RegexSet::new(regexes).unwrap()
+}
+
+fn compile_regex_sets(patterns: (&[&str], &[&str])) -> (RegexSet, RegexSet) {
+    (compile_regex_set(patterns.0), compile_regex_set(patterns.1))
+}
+
+fn compile_pcre2_jit_set(patterns: &[&str]) -> Vec<Pcre2Regex> {
+    let mut builder = Pcre2RegexBuilder::new();
+    builder.jit_if_available(true);
+    patterns
+        .iter()
+        .map(|pattern| builder.build(&pcre2_glob_regex(pattern)).unwrap())
+        .collect()
+}
+
+fn compile_pcre2_jit_sets(patterns: (&[&str], &[&str])) -> (Vec<Pcre2Regex>, Vec<Pcre2Regex>) {
+    (
+        compile_pcre2_jit_set(patterns.0),
+        compile_pcre2_jit_set(patterns.1),
+    )
+}
+
+fn count_fast_glob(
+    include_patterns: &[&str],
+    exclude_patterns: &[&str],
+    paths: &[String],
+) -> usize {
     paths
         .iter()
         .filter(|path| {
-            INCLUDE_PATTERNS
+            include_patterns
                 .iter()
                 .any(|pattern| fast_glob::glob_match(pattern, path))
-                && !EXCLUDE_PATTERNS
+                && !exclude_patterns
                     .iter()
                     .any(|pattern| fast_glob::glob_match(pattern, path))
         })
@@ -174,35 +257,92 @@ fn count_wax(include_any: &wax::Any<'_>, exclude_any: &wax::Any<'_>, paths: &[St
         .count()
 }
 
-fn bench_multi_pattern(c: &mut Criterion) {
-    let mut group = c.benchmark_group("ignore_list_match");
+fn count_regex_set(include_set: &RegexSet, exclude_set: &RegexSet, paths: &[String]) -> usize {
+    paths
+        .iter()
+        .filter(|path| {
+            include_set.is_match(path.as_bytes()) && !exclude_set.is_match(path.as_bytes())
+        })
+        .count()
+}
+
+fn count_pcre2_jit(
+    include_set: &[Pcre2Regex],
+    exclude_set: &[Pcre2Regex],
+    paths: &[String],
+) -> usize {
+    paths
+        .iter()
+        .filter(|path| {
+            let path = path.as_bytes();
+            include_set
+                .iter()
+                .any(|regex| regex.is_match(path).unwrap())
+                && !exclude_set
+                    .iter()
+                    .any(|regex| regex.is_match(path).unwrap())
+        })
+        .count()
+}
+
+fn bench_pattern_list(
+    c: &mut Criterion,
+    group_name: &str,
+    include_patterns: &[&str],
+    exclude_patterns: &[&str],
+    make_corpus: fn(usize) -> Vec<String>,
+    bench_glob_scan: bool,
+    bench_wax: bool,
+) {
+    let mut group = c.benchmark_group(group_name);
 
     for size in [256, 4_096, 65_536] {
-        let paths = corpus(size);
-        let glob_include = compile_glob_list(INCLUDE_PATTERNS);
-        let glob_exclude = compile_glob_list(EXCLUDE_PATTERNS);
-        let (globset_include, globset_exclude) = compile_globsets();
-        let wax_include = wax::any(INCLUDE_PATTERNS.iter().copied()).unwrap();
-        let wax_exclude = wax::any(EXCLUDE_PATTERNS.iter().copied()).unwrap();
+        let paths = make_corpus(size);
+        let glob_patterns = bench_glob_scan.then(|| {
+            (
+                compile_glob_list(include_patterns),
+                compile_glob_list(exclude_patterns),
+            )
+        });
+        let globset_include = compile_globset(include_patterns);
+        let globset_exclude = compile_globset(exclude_patterns);
+        let regex_include = compile_regex_set(include_patterns);
+        let regex_exclude = compile_regex_set(exclude_patterns);
+        let pcre2_include = compile_pcre2_jit_set(include_patterns);
+        let pcre2_exclude = compile_pcre2_jit_set(exclude_patterns);
+        let wax_patterns = bench_wax.then(|| {
+            (
+                wax::any(include_patterns.iter().copied()).unwrap(),
+                wax::any(exclude_patterns.iter().copied()).unwrap(),
+            )
+        });
         group.throughput(Throughput::Elements(size as u64));
 
         group.bench_with_input(
             BenchmarkId::new("fast-glob/scan", size),
             &paths,
             |b, paths| {
-                b.iter(|| count_fast_glob(black_box(paths)));
+                b.iter(|| {
+                    count_fast_glob(
+                        black_box(include_patterns),
+                        black_box(exclude_patterns),
+                        black_box(paths),
+                    )
+                });
             },
         );
 
-        group.bench_with_input(BenchmarkId::new("glob/scan", size), &paths, |b, paths| {
-            b.iter(|| {
-                count_glob(
-                    black_box(&glob_include),
-                    black_box(&glob_exclude),
-                    black_box(paths),
-                )
+        if let Some((glob_include, glob_exclude)) = &glob_patterns {
+            group.bench_with_input(BenchmarkId::new("glob/scan", size), &paths, |b, paths| {
+                b.iter(|| {
+                    count_glob(
+                        black_box(glob_include),
+                        black_box(glob_exclude),
+                        black_box(paths),
+                    )
+                });
             });
-        });
+        }
 
         group.bench_with_input(BenchmarkId::new("globset/set", size), &paths, |b, paths| {
             b.iter(|| {
@@ -214,18 +354,68 @@ fn bench_multi_pattern(c: &mut Criterion) {
             });
         });
 
-        group.bench_with_input(BenchmarkId::new("wax/any", size), &paths, |b, paths| {
+        group.bench_with_input(BenchmarkId::new("regex/set", size), &paths, |b, paths| {
             b.iter(|| {
-                count_wax(
-                    black_box(&wax_include),
-                    black_box(&wax_exclude),
+                count_regex_set(
+                    black_box(&regex_include),
+                    black_box(&regex_exclude),
                     black_box(paths),
                 )
             });
         });
+
+        group.bench_with_input(
+            BenchmarkId::new("pcre2/jit-scan", size),
+            &paths,
+            |b, paths| {
+                b.iter(|| {
+                    count_pcre2_jit(
+                        black_box(&pcre2_include),
+                        black_box(&pcre2_exclude),
+                        black_box(paths),
+                    )
+                });
+            },
+        );
+
+        if let Some((wax_include, wax_exclude)) = &wax_patterns {
+            group.bench_with_input(BenchmarkId::new("wax/any", size), &paths, |b, paths| {
+                b.iter(|| {
+                    count_wax(
+                        black_box(wax_include),
+                        black_box(wax_exclude),
+                        black_box(paths),
+                    )
+                });
+            });
+        }
     }
 
     group.finish();
+}
+
+fn bench_multi_pattern(c: &mut Criterion) {
+    bench_pattern_list(
+        c,
+        "ignore_list_match",
+        INCLUDE_PATTERNS,
+        EXCLUDE_PATTERNS,
+        corpus,
+        true,
+        true,
+    );
+}
+
+fn bench_typescript_negative(c: &mut Criterion) {
+    bench_pattern_list(
+        c,
+        "typescript_negative_match",
+        TYPESCRIPT_INCLUDE_PATTERNS,
+        TYPESCRIPT_EXCLUDE_PATTERNS,
+        typescript_corpus,
+        false,
+        false,
+    );
 }
 
 fn bench_compile(c: &mut Criterion) {
@@ -242,6 +432,18 @@ fn bench_compile(c: &mut Criterion) {
         b.iter(|| compile_globsets());
     });
 
+    group.bench_function("regex_set", |b| {
+        b.iter(|| {
+            compile_regex_sets(black_box((INCLUDE_PATTERNS, EXCLUDE_PATTERNS)));
+        });
+    });
+
+    group.bench_function("pcre2_jit_scan", |b| {
+        b.iter(|| {
+            compile_pcre2_jit_sets(black_box((INCLUDE_PATTERNS, EXCLUDE_PATTERNS)));
+        });
+    });
+
     group.bench_function("wax_any", |b| {
         b.iter(|| {
             (
@@ -254,5 +456,10 @@ fn bench_compile(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_multi_pattern, bench_compile);
+criterion_group!(
+    benches,
+    bench_multi_pattern,
+    bench_typescript_negative,
+    bench_compile
+);
 criterion_main!(benches);
